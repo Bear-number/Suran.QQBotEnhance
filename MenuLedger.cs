@@ -44,7 +44,6 @@ public sealed class MenuLedger(int capacity)
         public bool Closed { get; set; }
         public string ClosedReason { get; set; } = "";
         public DateTime? ClosedAt { get; set; }
-        public bool Notified { get; set; }
 
         public DateTime? Deadline => ExpiresAt;
         public int OptionCount => Options.Count;
@@ -150,13 +149,13 @@ public sealed class MenuLedger(int capacity)
         if (menu.Closed)
         {
             return new MatchResult(menu, optionIndex, false,
-                "菜单「" + menu.Title + "」已经" + CloseText(menu.ClosedReason) + "，这条选择不要执行");
+                "菜单「" + menu.Title + "」已经" + CloseText(menu.ClosedReason) + Guard(menu));
         }
         if (menu.ExpiresAt != null && DateTime.Now > menu.ExpiresAt)
         {
             Close(menu, "expired");
             return new MatchResult(menu, optionIndex, false,
-                "菜单「" + menu.Title + "」已过期（截止 " + menu.ExpiresAt!.Value.ToString("MM-dd HH:mm") + "），这条选择不要执行");
+                "菜单「" + menu.Title + "」已过期（截止 " + menu.ExpiresAt!.Value.ToString("MM-dd HH:mm") + "）" + Guard(menu));
         }
 
         string label = menu.Options[optionIndex];
@@ -171,7 +170,7 @@ public sealed class MenuLedger(int capacity)
                 menu.CooldownHits++;
                 return new MatchResult(menu, optionIndex, false,
                     "菜单「" + menu.Title + "」第 " + (optionIndex + 1) + " 项在冷却中，还要等 "
-                    + (menu.CooldownSeconds - elapsed) + " 秒");
+                    + (menu.CooldownSeconds - elapsed) + " 秒" + Guard(menu));
             }
         }
 
@@ -179,13 +178,13 @@ public sealed class MenuLedger(int capacity)
         {
             Close(menu, "full");
             return new MatchResult(menu, optionIndex, false,
-                "菜单「" + menu.Title + "」名额已满（共 " + menu.MaxTotal + " 份），这条选择不要执行");
+                "菜单「" + menu.Title + "」名额已满（共 " + menu.MaxTotal + " 份）" + Guard(menu));
         }
         if (menu.PerUser > 0 && userCount >= menu.PerUser)
         {
             return new MatchResult(menu, optionIndex, false,
                 "这个人已经选过菜单「" + menu.Title + "」第 " + (optionIndex + 1) + " 项 " + userCount
-                + " 次，每人上限 " + menu.PerUser + " 次，这条不要执行");
+                + " 次，每人上限 " + menu.PerUser + " 次" + Guard(menu));
         }
 
         state.Total++;
@@ -199,12 +198,11 @@ public sealed class MenuLedger(int capacity)
         if (menu.MaxTotal > 0 && menu.Total >= menu.MaxTotal)
         {
             Close(menu, "full");
-            verdict += "；刚好收满，后面的选择都作废了";
+            verdict += menu.Hard ? "；刚好收满，后面的选择都作废了" : "；名额到这里用完了";
         }
         else if (menu.Notify && menu.PerUser > 0 && userCount + 1 >= menu.PerUser)
         {
             verdict += "；这个人的可选次数已经用满";
-            menu.Notified = true;
         }
         return new MatchResult(menu, optionIndex, true, verdict);
     }
@@ -262,7 +260,6 @@ public sealed class MenuLedger(int capacity)
         menu.Closed = false;
         menu.ClosedReason = "";
         menu.ClosedAt = null;
-        menu.Notified = false;
         if (menu.Shared)
         {
             menu.StateOf(0);
@@ -351,6 +348,10 @@ public sealed class MenuLedger(int capacity)
             || record.Code.Contains(needle, StringComparison.OrdinalIgnoreCase)
             || record.Seq.ToString() == needle.TrimStart('#');
     }
+
+    // hard=true 直接把话说明白；hard=false 只报事实，拦不拦由模型自己判断
+    static string Guard(MenuRecord menu)
+        => menu.Hard ? "，这条选择不要执行" : "，这条没算进名额，要不要照办你自己拿主意";
 
     static string CloseText(string reason) => reason switch
     {

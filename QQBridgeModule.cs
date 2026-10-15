@@ -49,12 +49,14 @@ public class QQBridgeModule(
     MessageRewriter rewriter = null!;
     OneBotClient? client;
     readonly SemaphoreSlim connectLock = new(1, 1);
+    // 协议端事件跑在 WebSocket 接收线程上，改写层和工具跑在别处，通讯录/台账/接口名单都得过这把锁
+    readonly object stateGate = new();
     readonly HashSet<string> unsupportedActions = [];
     readonly List<string> orderedActions = [];
-    string lastFailure = "";
     string directoryFilePath = "";
     string menuFilePath = "";
     long botId;
+    bool rewriteFailureReported;
 
     protected override Task OnAwake()
     {
@@ -106,19 +108,23 @@ public class QQBridgeModule(
     {
         ChatBot.ChatSend -= OnMessageText;
         ChatBot.PokeSend -= OnMessageText;
+        // 先落盘再断开：Dispose 抛异常的话不能把通讯录和台账一起带走
+        lock (stateGate)
+        {
+            if (Configuration.PersistDirectory)
+            {
+                directory.Save(directoryFilePath);
+            }
+            if (Configuration.PersistMenu)
+            {
+                ledger.Save(menuFilePath);
+            }
+        }
         if (client != null)
         {
             client.EventReceived -= OnOneBotEvent;
             await client.DisposeAsync();
             client = null;
-        }
-        if (Configuration.PersistDirectory)
-        {
-            directory.Save(directoryFilePath);
-        }
-        if (Configuration.PersistMenu)
-        {
-            ledger.Save(menuFilePath);
         }
     }
 
@@ -135,25 +141,38 @@ public class QQBridgeModule(
         lines.Add("[连接] " + (connected ? "在线" : "还没连上") + "｜" + qChatService.Configuration.Url
             + "｜机器人QQ号 " + (botId != 0 ? botId.ToString(CultureInfo.InvariantCulture) : "未知"));
         lines.Add("[改写] " + DescribeRewriteFlags());
-        lines.Add("[通讯录] " + directory.PersonCount + " 个人、" + directory.GroupCount + " 个群，"
-            + (directory.LastSyncTime == null ? "还没整体同步过群成员表" : "上次同步 " + directory.LastSyncTime!.Value.ToString("MM-dd HH:mm"))
-            + (Configuration.PersistDirectory ? "，落盘 " + directoryFilePath : "，只在内存里"));
-        lines.Add("[菜单台账] " + ledger.Count + " 个活动" + (Configuration.PersistMenu ? "，落盘 " + menuFilePath : ""));
+        lock (stateGate)
+        {
+            lines.Add("[通讯录] " + directory.PersonCount + " 个人、" + directory.GroupCount + " 个群，"
+                + (directory.LastSyncTime == null ? "还没整体同步过群成员表" : "上次同步 " + directory.LastSyncTime!.Value.ToString("MM-dd HH:mm"))
+                + (Configuration.PersistDirectory ? "，落盘 " + directoryFilePath : "，只在内存里"));
+            lines.Add("[菜单台账] " + ledger.Count + " 个活动" + (Configuration.PersistMenu ? "，落盘 " + menuFilePath : ""));
+        }
 
         List<string> monitoring = [];
         foreach (KeyValuePair<long, GroupState> pair in qChatService.GroupStates)
         {
             if (pair.Value.IsEnabled)
             {
-                monitoring.Add(pair.Key + (directory.GroupName(pair.Key).Length > 0 ? "（" + directory.GroupName(pair.Key) + "）" : ""));
+                string known;
+                lock (stateGate)
+                {
+                    known = directory.GroupName(pair.Key);
+                }
+                monitoring.Add(pair.Key + (known.Length > 0 ? "（" + known + "）" : ""));
             }
         }
         lines.Add("[群监听] " + (monitoring.Count == 0 ? "当前没有开启中的群" : string.Join("、", monitoring)));
 
-        foreach (string action in orderedActions)
+        List<string> tried;
+        lock (stateGate)
         {
-            bool supported = unsupportedActions.Contains(action) == false;
-            lines.Add("[接口] " + action + (supported ? " 可用" : " 当前协议端不支持，已自动改用其他方式"));
+            tried = orderedActions.ConvertAll(action =>
+                action + (unsupportedActions.Contains(action) ? " 当前协议端不支持，已自动改用其他方式" : " 可用"));
+        }
+        foreach (string line in tried)
+        {
+            lines.Add("[接口] " + line);
         }
         if (connected == false)
         {
@@ -194,14 +213,21 @@ public class QQBridgeModule(
         {
             await AppendSelfShutFromList(lines, groupId);
         }
-        string selfRole = directory.RoleOf(groupId, botId);
+        string selfRole;
+        lock (stateGate)
+        {
+            selfRole = directory.RoleOf(groupId, botId);
+        }
         if (selfRole.Length > 0)
         {
             lines.Add("机器人在群里的身份：" + selfRole + "（来自上次同步的成员表，要确认最新状态就再 sync_group_members 一次）");
         }
 
         await AppendAtAllRemain(lines, groupId);
-        directory.LearnGroup(groupId, FindString(info, "group_name"));
+        lock (stateGate)
+        {
+            directory.LearnGroup(groupId, FindString(info, "group_name"));
+        }
         interactor.Poke(Truncate(string.Join("\n", lines)));
     }
 
@@ -212,21 +238,22 @@ public class QQBridgeModule(
     {
         List<JsonElement> rows;
         string source;
-        JsonElement? shutList = await TryCallAsync("get_group_shut_list", new { group_id = groupId });
-        if (shutList != null)
+        CallOutcome shutList = await TryCallAsync("get_group_shut_list", new { group_id = groupId });
+        if (shutList.Data != null)
         {
-            rows = ReadArray(shutList.Value);
+            rows = ReadArray(shutList.Data.Value);
             source = "禁言名单接口";
         }
         else
         {
-            JsonElement? members = await TryCallAsync("get_group_member_list", new { group_id = groupId });
-            if (members == null)
+            CallOutcome members = await TryCallAsync("get_group_member_list", new { group_id = groupId });
+            if (members.Data == null)
             {
-                throw new Exception("这个协议端既没有禁言名单接口，也不返回成员表，查不到谁被禁言。可以逐个用 find_member 查已知的人");
+                throw new Exception("这个协议端既没有禁言名单接口，也不返回成员表，查不到谁被禁言（"
+                    + shutList.Failure + "／" + members.Failure + "）。可以逐个用 find_member 查已知的人");
             }
             rows = [];
-            foreach (JsonElement member in ReadArray(members.Value))
+            foreach (JsonElement member in ReadArray(members.Data.Value))
             {
                 if (FindNumber(member, "shut_up_timestamp") > NowUnixSeconds())
                 {
@@ -243,22 +270,25 @@ public class QQBridgeModule(
         }
         int limit = Math.Clamp(Configuration.MaxMemberRows, 1, 500);
         List<string> lines = new() { "[" + groupId + " 禁言中 " + rows.Count + " 人，来源：" + source + "，最多显示 " + limit + " 人]" };
-        for (int index = 0; index < Math.Min(limit, rows.Count); index++)
+        lock (stateGate)
         {
-            JsonElement row = rows[index];
-            long userId = FindNumber(row, "user_id");
-            string name = OrUnknown(directory.DisplayName(userId, groupId, Configuration.PreferGroupCard));
-            long until = FindNumber(row, "shut_up_timestamp", "shut_timestamp");
-            lines.Add(userId + "｜" + name + "｜" + (until > 0 ? UnixToString(until) + " 解禁（还剩 " + Remaining(until) + "）" : "解禁时间未知"));
-            directory.Learn(userId, FindString(row, "nickname", "card_or_nickname"), groupId, FindString(row, "card"));
+            for (int index = 0; index < Math.Min(limit, rows.Count); index++)
+            {
+                JsonElement row = rows[index];
+                long userId = FindNumber(row, "user_id");
+                string name = OrUnknown(directory.DisplayName(userId, groupId, Configuration.PreferGroupCard));
+                long until = FindNumber(row, "shut_up_timestamp", "shut_timestamp");
+                lines.Add(userId + "｜" + name + "｜" + (until > 0 ? UnixToString(until) + " 解禁（还剩 " + Remaining(until) + "）" : "解禁时间未知"));
+                directory.Learn(userId, FindString(row, "nickname", "card_or_nickname"), groupId, FindString(row, "card"));
+            }
+            if (source == "成员表的禁言时间戳")
+            {
+                directory.MarkSynced();
+            }
         }
         if (rows.Count > limit)
         {
             lines.Add("还有 " + (rows.Count - limit) + " 人没显示，提高「输出·成员最多列出」或点名查 find_member");
-        }
-        if (source == "成员表的禁言时间戳")
-        {
-            directory.MarkSynced();
         }
         interactor.Poke(Truncate(string.Join("\n", lines)));
     }
@@ -276,18 +306,27 @@ public class QQBridgeModule(
             throw new Exception("find_member 需要给 keyword，名字或QQ号片段都行");
         }
         int shownLimit = limit > 0 ? Math.Clamp(limit, 1, 200) : Math.Clamp(Configuration.MaxMemberRows, 1, 500);
-        List<PersonDirectory.MatchedPerson> matched = directory.Search(text, groupId, shownLimit);
+        List<PersonDirectory.MatchedPerson> matched;
+        int people;
+        lock (stateGate)
+        {
+            matched = directory.Search(text, groupId, shownLimit);
+            people = directory.PersonCount;
+        }
         if (matched.Count == 0)
         {
-            interactor.Poke("通讯录里没有名字含「" + text + "」的人（现在记了 " + directory.PersonCount + " 个）。"
+            interactor.Poke("通讯录里没有名字含「" + text + "」的人（现在记了 " + people + " 个）。"
                 + "这个群还没同步过的话用 sync_group_members group_id=" + groupId + " 拉一次成员表");
             return;
         }
 
         List<string> lines = new() { "[" + text + " 命中 " + matched.Count + " 人]" };
-        foreach (PersonDirectory.MatchedPerson person in matched)
+        lock (stateGate)
         {
-            lines.Add(person.UserId + "｜" + person.Name + "｜" + person.Source + "｜" + DescribeIdentity(person.UserId, groupId));
+            foreach (PersonDirectory.MatchedPerson person in matched)
+            {
+                lines.Add(person.UserId + "｜" + person.Name + "｜" + person.Source + "｜" + DescribeIdentity(person.UserId, groupId));
+            }
         }
         interactor.Poke(Truncate(string.Join("\n", lines)));
     }
@@ -308,37 +347,42 @@ public class QQBridgeModule(
         int cardCount = 0;
         List<string> rows = [];
         int rowLimit = Math.Clamp(maxRows, 0, Math.Clamp(Configuration.MaxMemberRows, 1, 500));
-        foreach (JsonElement member in members)
+        int totalPeople;
+        lock (stateGate)
         {
-            long userId = FindNumber(member, "user_id");
-            string nickname = FindString(member, "card_or_nickname", "nickname");
-            string card = FindString(member, "card");
-            string role = FindString(member, "role");
-            directory.Learn(userId, nickname.Length > 0 ? nickname : card, groupId, card);
-            directory.LearnRole(groupId, userId, RoleText(role));
-            if (card.Length > 0)
+            foreach (JsonElement member in members)
             {
-                cardCount++;
+                long userId = FindNumber(member, "user_id");
+                string nickname = FindString(member, "card_or_nickname", "nickname");
+                string card = FindString(member, "card");
+                string role = FindString(member, "role");
+                directory.Learn(userId, nickname.Length > 0 ? nickname : card, groupId, card);
+                directory.LearnRole(groupId, userId, RoleText(role));
+                if (card.Length > 0)
+                {
+                    cardCount++;
+                }
+                if (rows.Count < rowLimit)
+                {
+                    long shutUntil = FindNumber(member, "shut_up_timestamp");
+                    rows.Add(userId + "｜" + (card.Length > 0 ? card : nickname) + "｜" + RoleText(role)
+                        + JoinTime(FindNumber(member, "join_time"))
+                        + (shutUntil > NowUnixSeconds() ? "｜禁言到 " + UnixToString(shutUntil) : "")
+                        + (FindNumber(member, "unfriendly") > 0 ? "｜曾被举报" : ""));
+                }
             }
-            if (rows.Count < rowLimit)
+            directory.MarkSynced();
+            totalPeople = directory.PersonCount;
+            if (Configuration.PersistDirectory)
             {
-                long shutUntil = FindNumber(member, "shut_up_timestamp");
-                rows.Add(userId + "｜" + (card.Length > 0 ? card : nickname) + "｜" + RoleText(role)
-                    + JoinTime(FindNumber(member, "join_time"))
-                    + (shutUntil > NowUnixSeconds() ? "｜禁言到 " + UnixToString(shutUntil) : "")
-                    + (FindNumber(member, "unfriendly") > 0 ? "｜曾被举报" : ""));
+                directory.Save(directoryFilePath);
             }
-        }
-        directory.MarkSynced();
-        if (Configuration.PersistDirectory)
-        {
-            directory.Save(directoryFilePath);
         }
 
         List<string> lines = new()
         {
             "已同步 " + groupId + " 的成员表：" + members.Count + " 人（其中 " + cardCount + " 人有群名片），"
-            + "通讯录累计 " + directory.PersonCount + " 人",
+            + "通讯录累计 " + totalPeople + " 人",
         };
         lines.AddRange(rows);
         if (members.Count > rowLimit)
@@ -411,13 +455,12 @@ public class QQBridgeModule(
     }
 
     [XmlFunction(FunctionMode.Content, "send_rich")]
-    [Description("发一条排版好的 QQ 消息：开闭标签之间放正文，空行分段，超过单条上限会自动拆成多条按顺序发。正文里写 @某人 会自动换成真正的@（按通讯录匹配，重名就不换）。想发图片/文件仍然用 QQ聊天 的 QImage、QFile")]
+    [Description("发一条排版好的 QQ 消息：开闭标签之间放正文，空行分段，超过单条上限会自动拆成多条按顺序发。正文里写 @某人 会自动换成真正的@（按通讯录匹配，重名就不换），写 @全体 就是@全体。想发图片/文件仍然用 QQ聊天 的 QImage、QFile")]
     public async Task SendRich(
         XmlExecutorContext context,
         [Description("group 发到群 / private 发到私聊")] string type,
         [Description("群号或对方QQ号")] long targetId,
-        [Description("把 **加粗**、# 标题、[文字](链接) 这类 Markdown 语法换成 QQ 能正常显示的样子，默认换")] bool stripMarkdown = true,
-        [Description("开头先@一下这个人（群聊才有意义）")] bool atSender = false)
+        [Description("把 **加粗**、# 标题、[文字](链接) 这类 Markdown 语法换成 QQ 能正常显示的样子，默认换")] bool stripMarkdown = true)
     {
         if (context.CallMode != CallMode.Closing)
         {
@@ -443,13 +486,16 @@ public class QQBridgeModule(
             throw new Exception("send_rich 的正文清洗完是空的，检查一下是不是整段都是图片标记");
         }
 
+        long atGroupId = messageType == OneBotMessageType.Group ? targetId : 0;
         int sent = 0;
         foreach (string segment in segments)
         {
-            string text = sent == 0 && atSender && messageType == OneBotMessageType.Group
-                ? "[CQ:at,qq=" + targetId + "] " + segment
-                : segment;
-            await SendAsync(messageType, targetId, ResolveAtNames(text, messageType == OneBotMessageType.Group ? targetId : 0));
+            string text;
+            lock (stateGate)
+            {
+                text = ResolveAtNames(segment, atGroupId);
+            }
+            await SendAsync(messageType, targetId, text);
             sent++;
             if (sent < segments.Count)
             {
@@ -503,20 +549,30 @@ public class QQBridgeModule(
                 + "，精简选项或拆成两个菜单");
         }
 
-        MenuLedger.MenuRecord record = ledger.Create(
-            messageType == OneBotMessageType.Group ? targetId : 0,
-            targetId, cleanTitle, options,
-            Math.Clamp(ttlSeconds, 0, 30 * 24 * 3600), until,
-            Math.Max(max, 0), Math.Max(per, 0), once, Math.Max(cooldownSeconds, 0),
-            hard, shared, notify);
-
-        string text = BuildMenuText(record);
-        record.MessageId = await SendAsync(messageType, targetId, text);
-        if (Configuration.PersistMenu)
+        MenuLedger.MenuRecord record;
+        string text;
+        lock (stateGate)
         {
-            ledger.Save(menuFilePath);
+            record = ledger.Create(
+                messageType == OneBotMessageType.Group ? targetId : 0,
+                targetId, cleanTitle, options,
+                Math.Clamp(ttlSeconds, 0, 30 * 24 * 3600), until,
+                Math.Max(max, 0), Math.Max(per, 0), once, Math.Max(cooldownSeconds, 0),
+                hard, shared, notify);
+            text = BuildMenuText(record);
         }
-        interactor.Poke(MenuLedger.FormatRow(record) + "｜已发到 "
+        record.MessageId = await SendAsync(messageType, targetId, text);
+
+        string row;
+        lock (stateGate)
+        {
+            if (Configuration.PersistMenu)
+            {
+                ledger.Save(menuFilePath);
+            }
+            row = MenuLedger.FormatRow(record);
+        }
+        interactor.Poke(row + "｜已发到 "
             + (messageType == OneBotMessageType.Group ? "群 " : "私聊 ") + targetId
             + "｜短码 " + record.Code + "，对方直接回 1、2、3 就会对上这条；要收摊用 menu_manage action=close selector=" + record.Seq);
     }
@@ -534,7 +590,12 @@ public class QQBridgeModule(
         if (resolvedAction == "stats")
         {
             int shownLimit = limit > 0 ? Math.Clamp(limit, 1, 50) : 20;
-            interactor.Poke(Truncate(ledger.FormatStats(selector, shownLimit)));
+            string stats;
+            lock (stateGate)
+            {
+                stats = ledger.FormatStats(selector, shownLimit);
+            }
+            interactor.Poke(Truncate(stats));
             return;
         }
 
@@ -547,23 +608,28 @@ public class QQBridgeModule(
         {
             throw new Exception("menu_manage action=extend 要给 minutes，至少 1 分钟");
         }
-        bool changed = resolvedAction switch
+        bool changed;
+        string row;
+        lock (stateGate)
         {
-            "close" => ledger.Close(wanted, "manual"),
-            "reset" => ledger.Reset(wanted),
-            _ => ledger.Extend(wanted, minutes),
-        };
+            changed = resolvedAction switch
+            {
+                "close" => ledger.Close(wanted, "manual"),
+                "reset" => ledger.Reset(wanted),
+                _ => ledger.Extend(wanted, minutes),
+            };
+            if (changed && Configuration.PersistMenu)
+            {
+                ledger.Save(menuFilePath);
+            }
+            MenuLedger.MenuRecord? record = changed ? ledger.Find(wanted) : null;
+            row = record == null ? wanted : MenuLedger.FormatRow(record);
+        }
         if (changed == false)
         {
             interactor.Poke("台账里找不到「" + wanted + "」这个菜单，或者它已经关了。先用 menu_manage action=stats 看看有哪些");
             return;
         }
-        if (Configuration.PersistMenu)
-        {
-            ledger.Save(menuFilePath);
-        }
-        MenuLedger.MenuRecord? record = ledger.Find(wanted);
-        string row = record == null ? wanted : MenuLedger.FormatRow(record);
         interactor.Poke(resolvedAction switch
         {
             "close" => "已关闭 " + row + (reason.Trim().Length > 0 ? "｜理由：" + reason.Trim() : ""),
@@ -587,7 +653,24 @@ public class QQBridgeModule(
         rewriter.NormalizeSegments = Configuration.NormalizeSegments;
         rewriter.MarkSelfEcho = Configuration.MarkSelfEcho;
         rewriter.BindMenuReplies = Configuration.BindMenuReplies;
-        return rewriter.Rewrite(message);
+        try
+        {
+            // 框架对 ChatSend 有兜底，对 PokeSend 没有（ChatBot 里那条循环不包 try），
+            // 这里抛出去会把整批群消息刷掉，所以宁可原样放行也只报一次错
+            lock (stateGate)
+            {
+                return rewriter.Rewrite(message);
+            }
+        }
+        catch (Exception rewriteError)
+        {
+            if (rewriteFailureReported == false)
+            {
+                rewriteFailureReported = true;
+                logger.LogWarning(rewriteError, "[QQ增强] 消息改写失败，这条原文进对话（后续同类失败不再重复报）");
+            }
+            return message;
+        }
     }
 
     void OnOneBotEvent(OneBotBaseEvent baseEvent)
@@ -602,8 +685,11 @@ public class QQBridgeModule(
             rewriter.BotId = botId;
         }
         long userId = messageEvent.Sender?.UserId ?? messageEvent.UserId;
-        directory.Learn(userId, messageEvent.Sender?.Nickname, messageEvent.GroupId, messageEvent.Sender?.Card);
-        directory.LearnGroup(messageEvent.GroupId, messageEvent.GroupName);
+        lock (stateGate)
+        {
+            directory.Learn(userId, messageEvent.Sender?.Nickname, messageEvent.GroupId, messageEvent.Sender?.Card);
+            directory.LearnGroup(messageEvent.GroupId, messageEvent.GroupName);
+        }
     }
 
     const string RewriteGuide =
@@ -631,12 +717,25 @@ public class QQBridgeModule(
                 try
                 {
                     await EnsureClientAsync();
+                    await Task.Delay(TimeSpan.FromSeconds(retrySeconds), DestroyCancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // 插件销毁时的正常退出，不该留一条没人看的失败任务
+                    return;
                 }
                 catch (Exception connectError)
                 {
                     logger.LogWarning("[QQ增强] 连不上 {Url}：{Message}", qChatService.Configuration.Url, connectError.Message);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(retrySeconds), DestroyCancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
                 }
-                await Task.Delay(TimeSpan.FromSeconds(retrySeconds), DestroyCancellationToken);
             }
         }, DestroyCancellationToken);
     }
@@ -669,66 +768,77 @@ public class QQBridgeModule(
 
     async Task<JsonElement> CallAsync(string action, object parameters, string operationName)
     {
-        JsonElement? data = await TryCallAsync(action, parameters);
-        if (data == null)
+        CallOutcome outcome = await TryCallAsync(action, parameters);
+        if (outcome.Data == null)
         {
-            throw new Exception(operationName + "没成功：" + lastFailure);
+            throw new Exception(operationName + "没成功：" + outcome.Failure);
         }
-        return data.Value;
+        return outcome.Data.Value;
     }
 
     // 三端对同一个动作名的支持不一样：1404/不支持的Api 记下来别再试，调用方据此回退
-    async Task<JsonElement?> TryCallAsync(string action, object parameters)
+    async Task<CallOutcome> TryCallAsync(string action, object parameters)
     {
-        lastFailure = "";
-        if (unsupportedActions.Contains(action))
+        lock (stateGate)
         {
-            lastFailure = "这个协议端不支持 " + action;
-            return null;
+            if (unsupportedActions.Contains(action))
+            {
+                return new CallOutcome(null, "这个协议端不支持 " + action);
+            }
         }
 
         try
         {
             await EnsureClientAsync();
-            if (client == null)
+            OneBotClient? connection = client;
+            if (connection == null)
             {
-                lastFailure = "连接还没建立";
-                return null;
+                return new CallOutcome(null, "连接还没建立");
             }
-            JsonElement? data = await client.CallActionAsync<JsonElement>(action, parameters);
+            JsonElement? data = await connection.CallActionAsync<JsonElement>(action, parameters);
             if (data == null || data.Value.ValueKind == JsonValueKind.Undefined)
             {
-                lastFailure = action + " 返回了空数据";
-                return null;
+                return new CallOutcome(null, action + " 返回了空数据");
             }
-            if (orderedActions.Contains(action) == false)
+            lock (stateGate)
             {
-                orderedActions.Add(action);
+                if (orderedActions.Contains(action) == false)
+                {
+                    orderedActions.Add(action);
+                }
             }
-            return data;
+            return new CallOutcome(data, "");
         }
         catch (Exception callError)
         {
-            lastFailure = DescribeFailure(callError.Message);
-            if (callError.Message.Contains("RetCode: 1404") || lastFailure.Contains("不支持"))
+            // 失败原因跟着返回值走，不存字段：两个工具同时调用会串台
+            string failure = DescribeFailure(callError.Message);
+            if (callError.Message.Contains("RetCode: 1404") || failure.Contains("不支持"))
             {
-                unsupportedActions.Add(action);
-                logger.LogInformation("[QQ增强] 协议端不支持 {Action}，后续自动改用其他方式", action);
+                bool firstTime;
+                lock (stateGate)
+                {
+                    firstTime = unsupportedActions.Add(action);
+                }
+                if (firstTime)
+                {
+                    logger.LogInformation("[QQ增强] 协议端不支持 {Action}，后续自动改用其他方式", action);
+                }
             }
-            return null;
+            return new CallOutcome(null, failure);
         }
     }
 
     async Task<long?> SendAsync(OneBotMessageType type, long targetId, string text)
     {
-        JsonElement? data = type == OneBotMessageType.Group
+        CallOutcome sent = type == OneBotMessageType.Group
             ? await TryCallAsync("send_group_msg", new { group_id = targetId, message = text })
             : await TryCallAsync("send_private_msg", new { user_id = targetId, message = text });
-        if (data == null)
+        if (sent.Data == null)
         {
-            throw new Exception("消息没发出去：" + lastFailure);
+            throw new Exception("消息没发出去：" + sent.Failure);
         }
-        long messageId = FindNumber(data.Value, "message_id", "real_id", "id");
+        long messageId = FindNumber(sent.Data.Value, "message_id", "real_id", "id");
         return messageId > 0 ? messageId : null;
     }
 
@@ -766,13 +876,13 @@ public class QQBridgeModule(
             lines.Add("机器人自己是否被禁言查不出来：还没拿到自己的QQ号");
             return;
         }
-        JsonElement? shutList = await TryCallAsync("get_group_shut_list", new { group_id = groupId });
-        if (shutList == null)
+        CallOutcome shutList = await TryCallAsync("get_group_shut_list", new { group_id = groupId });
+        if (shutList.Data == null)
         {
             lines.Add("机器人自己是否被禁言查不出来：这个协议端既不在群资料里给时间戳，也没有禁言名单接口");
             return;
         }
-        foreach (JsonElement row in ReadArray(shutList.Value))
+        foreach (JsonElement row in ReadArray(shutList.Data.Value))
         {
             if (FindNumber(row, "user_id") != botId)
             {
@@ -789,12 +899,12 @@ public class QQBridgeModule(
 
     async Task AppendAtAllRemain(List<string> lines, long groupId)
     {
-        JsonElement? remain = await TryCallAsync("get_group_at_all_remain", new { group_id = groupId });
-        if (remain == null)
+        CallOutcome remain = await TryCallAsync("get_group_at_all_remain", new { group_id = groupId });
+        if (remain.Data == null)
         {
             return;
         }
-        JsonElement data = remain.Value;
+        JsonElement data = remain.Data.Value;
         if (FindBool(data, "can_at_all") == false)
         {
             lines.Add("@全体：现在不能@全体（一般是群限制）");
@@ -944,9 +1054,16 @@ public class QQBridgeModule(
             return [line];
         }
         List<string> pieces = [];
-        for (int start = 0; start < line.Length; start += SegmentCharLimit)
+        for (int start = 0; start < line.Length;)
         {
-            pieces.Add(line.Substring(start, Math.Min(SegmentCharLimit, line.Length - start)));
+            int take = Math.Min(SegmentCharLimit, line.Length - start);
+            // 末位正好是 emoji 的前半个字就挪到下一段，不然切出来是乱码
+            if (start + take < line.Length && char.IsHighSurrogate(line[start + take - 1]))
+            {
+                take--;
+            }
+            pieces.Add(line.Substring(start, take));
+            start += take;
         }
         return pieces;
     }
@@ -1158,10 +1275,12 @@ public class QQBridgeModule(
 
     static DecodedText Decode(byte[] body)
     {
+        byte[] payload = StripBom(body);
         UTF8Encoding strictUtf8 = new(false, true);
         try
         {
-            return new DecodedText(true, strictUtf8.GetString(StripBom(body)));
+            string text = strictUtf8.GetString(payload);
+            return new DecodedText(LooksReadable(text), text);
         }
         catch (DecoderFallbackException)
         {
@@ -1170,9 +1289,31 @@ public class QQBridgeModule(
         Encoding? gbk = TryGetEncoding(936);
         if (gbk != null)
         {
-            return new DecodedText(true, gbk.GetString(StripBom(body)));
+            // GBK 几乎什么字节都能凑出字来，所以解完还要看乱码比例，不能一解出东西就当成文本
+            string text = gbk.GetString(payload);
+            return new DecodedText(LooksReadable(text), text);
         }
         return new DecodedText(false, "");
+    }
+
+    static bool LooksReadable(string text)
+    {
+        int sample = Math.Min(text.Length, 4096);
+        if (sample == 0)
+        {
+            return false;
+        }
+        int bad = 0;
+        for (int index = 0; index < sample; index++)
+        {
+            char character = text[index];
+            if (character == '\uFFFD' || character == '\u0000'
+                || (char.IsControl(character) && character != '\t' && character != '\n' && character != '\r'))
+            {
+                bad++;
+            }
+        }
+        return bad * 100 < sample * 5;
     }
 
     static Encoding? TryGetEncoding(int codePage)
@@ -1254,6 +1395,8 @@ public class QQBridgeModule(
             return tail;
         }
     }
+
+    sealed record CallOutcome(JsonElement? Data, string Failure);
 
     sealed record FetchResult(byte[] Body, bool Truncated, string FileName, long Length);
 

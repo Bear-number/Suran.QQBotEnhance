@@ -21,11 +21,13 @@ public sealed class MessageRewriter(PersonDirectory directory)
         @"^(?<private>\[私聊\])?\[(?<id>\d{4,12})(?:\((?<name>[^)]*)\))?\]:(?<body>.*)$",
         RegexOptions.Compiled);
 
+    // 群名里带括号是常态（「研发(1)群」），所以名字用惰性匹配交给结尾的 )] 去收
     static readonly Regex GroupHeaderPattern = new(
-        @"\[Q群消息\((?<id>\d+)(?:,(?<name>[^)\]]*))?\)\]",
+        @"\[Q群消息\((?<id>\d+)(?:,(?<name>.*?))?\)\]",
         RegexOptions.Compiled);
 
     static readonly Regex AtPattern = new(@"@(?<id>\d{4,12})(?![0-9])", RegexOptions.Compiled);
+    static readonly Regex AtAllPattern = new(@"\[CQ:at,.*?qq=all[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     static readonly Regex RecordPattern = new(@"\[CQ:record[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     static readonly Regex VideoPattern = new(@"\[CQ:video[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -49,8 +51,12 @@ public sealed class MessageRewriter(PersonDirectory directory)
             Match header = GroupHeaderPattern.Match(lines[index]);
             if (header.Success)
             {
-                currentGroupId = long.Parse(header.Groups["id"].Value);
-                directory.LearnGroup(currentGroupId, header.Groups["name"].Value);
+                // 号码长到放不下（协议端抽风给了非数字）就把群号当不知道，不能沿用上一个群的
+                currentGroupId = long.TryParse(header.Groups["id"].Value, out long headerGroupId) ? headerGroupId : 0;
+                if (currentGroupId != 0)
+                {
+                    directory.LearnGroup(currentGroupId, header.Groups["name"].Value);
+                }
             }
 
             Match speaker = SpeakerPattern.Match(lines[index]);
@@ -113,7 +119,9 @@ public sealed class MessageRewriter(PersonDirectory directory)
 
     string NormalizeSegmentsOf(string body)
     {
-        string result = RecordPattern.Replace(body, match => Shorten("语音", match.Value));
+        // 框架的 @过滤只认数字号，qq=all 的@全体会整条原始段留在上下文里
+        string result = AtAllPattern.Replace(body, "@全体");
+        result = RecordPattern.Replace(result, match => Shorten("语音", match.Value));
         result = VideoPattern.Replace(result, match => Shorten("视频", match.Value));
         result = CardPattern.Replace(result, match => Shorten("卡片", match.Value));
         result = MusicPattern.Replace(result, match => Shorten("音乐分享", match.Value));

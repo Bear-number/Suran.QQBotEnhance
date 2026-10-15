@@ -3,7 +3,7 @@
 QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消息**发得体**。移植自工作区的 `KiraAI-qqbot-fullmsg-bridge-plugin-main`（KiraAI 的 QQ 官方机器人 fullmsg bridge 插件，Python），按 Alife 的传输现实（只有 OneBot v11：NapCat / LLOneBot / SnowLuma）逐条重做，源插件的能力一条没落下，落不下的都写明了为什么。
 
 ## 版本
-4.0.0（对应 Alife 客户端 4.2.x）
+4.0.1（对应 Alife 客户端 4.2.x）
 
 ## 依赖
 - Alife.Function.FunctionCaller
@@ -29,7 +29,7 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 | `<find_member keyword groupid? limit?/>` | 本地通讯录按名字/名片/QQ号片段找人，不联网、秒回 |
 | `<sync_group_members groupid maxrows?/>` | 拉群成员表灌进通讯录（QQ号、昵称、群名片、群身份） |
 | `<read_attached_file url? groupid? fileid? userid? filename?/>` | 读聊天里的文件正文（txt/md/代码/配置），二进制只报名字、大小、类型 |
-| `<send_rich type targetid stripmarkdown? atsender?>正文</send_rich>` | 发排版好的消息：Markdown 降级、空行分段、超上限自动拆多条、`@某人` 换成真@ |
+| `<send_rich type targetid stripmarkdown?>正文</send_rich>` | 发排版好的消息：Markdown 降级、空行分段、超上限自动拆多条、`@某人` 换成真@、`@全体` 换成 `qq=all` |
 | `<create_menu type targetid title ttlseconds? until? max? per? once? cooldownseconds? hard? shared? notify?>选项</create_menu>` | 发编号菜单并登记进台账，对方回编号就等于点按钮 |
 | `<menu_manage action selector? minutes? reason? limit?/>` | 看台账统计、提前关闭、清空重选、延长截止时间（只动本地台账，不重发消息） |
 
@@ -129,6 +129,14 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 - **编译**：`dotnet build .buildcheck/QQBridgeCheck.csproj` → 0 警告 0 错误
 - **离线探针**：`scratch/qbridge-probe`（`dotnet run --project QQBridgeProbe.csproj`，或看 `probe-out.txt`）跑过九段核对：注册面文档行、改写层真实入站形状（名片/空昵称/段压缩/回声/菜单对账/@摘除/群头限定）、台账的 once/per/max/cooldown/shared/短码/超范围/歧义/过期与跨零点 `until`、存盘读回不撞号且计数还在、通讯录 LRU 与打分与精确重名拒猜、Plainize/4000 字拆条/超长单行硬拆、编码链与二进制嗅探与人话大小、选项解析与截断
 - **探针顺手抓出来并修掉的坑**：`Close(menu, reason)` 私有重载被写丢导致内部关单全绑到公开重载、`ConvertAll(FormatShort)` 方法组类型推不出来、`UTF8Encoding(throwOnInvalidBytes:)` 单参构造不存在、报了编号超出选项数与只报短码两种回复会被**静默丢弃**（模型看不到任何对账）、`![图片](链接)` 被链接规则吃掉留下 `!图片：链接`、代码页 936 在没有注册 CodePagesEncodingProvider 的运行时抛的是 `NotSupportedException`（原来只接 `ArgumentException`，会把读文件流程炸穿）
+- **发布后复查又抓出来修掉的（4.0.1）**：
+  - `create_menu` 的 `hard=false` 只写进台账、对账文案照旧写"不要执行"，等于这个开关是摆设 → 现在硬拦与只提示两种口径分开
+  - `send_rich` 的 `atsender` 拼的是 `[CQ:at,qq=<群号>]`（把群号当QQ号@），删掉；要@谁在正文里写 `@名字`
+  - 协议端事件跑在 WebSocket 接收线程上，通讯录/台账/接口名单与改写层、工具之间没有互斥 → 统一用一把 `stateGate`；改写钩子加了兜底（框架的 `PokeSend` 循环不包 try，抛出去会把整批群消息刷掉）
+  - 群名带括号（`研发(1)群`）时群头正则匹配不上，那一块消息的群号、名片、菜单对账会整体失效 → 改成惰性收名字，群号解析失败时不沿用上一个群
+  - `[CQ:at,qq=all]` 框架不过滤，会整段留在上下文里 → 压成 `@全体`
+  - GBK 什么字节都能"解出字"，无后缀的二进制会被当成文本喂给模型 → 解完再看乱码比例
+  - 超长单行硬拆可能切在 emoji 的代理对中间；连接维护循环在插件销毁时留一条没人看的失败任务；`OnDestroy` 先断连接后落盘（断开抛异常就把通讯录一起丢了）
 - **没做的**：没连协议端实弹。`group_status`/`muted_members`/`sync_group_members`/`read_attached_file`/`send_rich`/`create_menu` 六条都要在 NapCat 或 LLOneBot 上真跑一遍才算数，其中 `get_group_shut_list`、`shut_up_me_timestamp`、`get_group_at_all_remain` 三家的支持面差异最容易在这里出岔子
 
 ## 打包
