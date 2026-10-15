@@ -17,8 +17,8 @@ using Microsoft.Extensions.Logging;
 
 namespace Suran.QQBridge;
 
-[Module("QQ消息增强",
-    "把 QQ 消息读清楚、发得体：进对话的消息补上昵称名片、压掉读不懂的原始消息段、标出机器人自己的回声，并记住见过的 QQ号/名片/群名；能读聊天附件正文、按名字找人、查群与禁言状态、发长内容自动分段排版，还能发编号菜单并把对方回的编号对回菜单项。全部走 OneBot v11，NapCat / LLOneBot / SnowLuma 通用",
+[Module("QQ官方机器人聊天增强",
+    "把机器人收发的 QQ 消息读清楚、发得体：进对话的消息补上昵称名片、压掉读不懂的原始消息段、标出机器人自己的回声，并记住见过的 QQ号/名片/群名；能读聊天附件正文、按名字找人、查群与禁言状态、发长内容自动分段排版，还能发编号菜单并把对方回的编号对回菜单项。传输走 NapCat / LLOneBot / SnowLuma 这类协议端的 OneBot v11 接口，不是 QQ 开放平台官方机器人（bot.qq.com）那套",
     defaultCategory: "苏染的工具",
     LaunchOrder = 9000)]
 public class QQBridgeModule(
@@ -78,7 +78,7 @@ public class QQBridgeModule(
 
         XmlHandler handler = new(this)
         {
-            Description = "QQ 消息增强：读清楚收到的消息、按名字找人、查群与禁言状态、读聊天附件、发长内容自动分段、发编号菜单并对账回复。",
+            Description = "QQ 官方机器人聊天增强：读清楚收到的消息、按名字找人、查群与禁言状态、读聊天附件、发长内容自动分段、发编号菜单并对账回复。",
             Explanation = "先决条件是 QQ聊天（OneBot）已经连上，本插件复用它的地址与密钥，只需要额外开一条连接，不用另配。"
                 + "改写层是自动生效的：收到的消息里 [QQ号(名字)] 的名字会被补全，@ 后面是名字而不是号码，"
                 + "[语音]、[视频: 链接]、[卡片: 标题]、[音乐分享]、[位置分享] 是压缩过的原始消息段，"
@@ -150,7 +150,8 @@ public class QQBridgeModule(
         }
 
         List<string> monitoring = [];
-        foreach (KeyValuePair<long, GroupState> pair in qChatService.GroupStates)
+        // 这两代 QChat 里这个状态的类型名不一样（GroupState / GroupMessageSource），交给推断
+        foreach (var pair in qChatService.GroupStates)
         {
             if (pair.Value.IsEnabled)
             {
@@ -693,11 +694,12 @@ public class QQBridgeModule(
     }
 
     const string RewriteGuide =
-        "本插件（QQ消息增强）会改写你收到的 QQ 消息，形态是这样的："
+        "本插件（QQ官方机器人聊天增强）会改写你收到的 QQ 消息，形态是这样的："
         + "发言标签 [QQ号(名字)] 里的名字优先用这个群的群名片，没有名片才用昵称，两者都没记到就只剩QQ号；"
         + "@ 后面是名字而不是QQ号，写成 @你 表示这条就是在叫你；"
         + "[语音]、[视频: 链接]、[卡片: 标题]、[音乐分享]、[位置分享] 是压缩过的原始消息段，里面的链接可以直接丢给 read_attached_file；"
         + "标签带 ·你自己 的那条是你自己刚发出去又被协议端推回来的回声，不要当成别人在追问；"
+        + "[私聊消息(QQ号,昵称)] 之后的正文行不带发言人标签，那整块都是头里那个人的私聊内容；"
         + "消息结尾的〔〕是编号菜单对账结果，写了「有效」才继续按那个选项办，写了「不要执行」或「别猜」就别办，直接问清楚。"
         + "发长内容用 send_rich（自动分段、能按名字@人），给别人挑选用 create_menu；"
         + "要找人的QQ号先 find_member（本地通讯录），没记录再 sync_group_members 拉成员表。"
@@ -1318,8 +1320,9 @@ public class QQBridgeModule(
 
     static Encoding? TryGetEncoding(int codePage)
     {
-        // 简体中文 Windows 自带代码页 936；精简运行时（没注册 CodePagesEncodingProvider 的 .NET）会直接说没有这个编码，
-        // 缺了就走「不是文本」分支，不能让它把整个读文件流程炸掉
+        // 本机 .NET 10 实测：GetEncoding(936) 抛的是 NotSupportedException（平台源码里没有注册 CodePagesEncodingProvider，
+        // 热编译插件也引不了那个包），所以 GBK 文本附件在这台机器上解不出来。缺了就返回 null 走「不是文本」分支，
+        // 宁可如实说读不了，也不能抛出去把整个读文件流程炸掉，更不能把乱码当正文给模型
         try
         {
             return Encoding.GetEncoding(codePage);

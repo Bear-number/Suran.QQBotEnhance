@@ -1,9 +1,11 @@
 # Suran.QQBridge
 
-QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消息**发得体**。移植自工作区的 `KiraAI-qqbot-fullmsg-bridge-plugin-main`（KiraAI 的 QQ 官方机器人 fullmsg bridge 插件，Python），按 Alife 的传输现实（只有 OneBot v11：NapCat / LLOneBot / SnowLuma）逐条重做，源插件的能力一条没落下，落不下的都写明了为什么。
+QQ 官方机器人聊天增强（插件显示名，原名「QQ消息增强」）：把机器人收发的消息**读清楚**、把要发的消息**发得体**。移植自工作区的 `KiraAI-qqbot-fullmsg-bridge-plugin-main`（KiraAI 的 QQ 官方机器人 fullmsg bridge 插件，Python），按 Alife 的传输现实（只有 OneBot v11：NapCat / LLOneBot / SnowLuma）逐条重做，源插件的能力一条没落下，落不下的都写明了为什么。
+
+**先分清一件事，下面通篇都是这个口径**：名字里的「官方机器人」指**被增强的那只机器人账号**——个人号登在协议端上，群里看它就是一只机器人。本插件的传输走 **NapCat / LLOneBot / SnowLuma 的 OneBot v11 接口**，**不是** QQ 开放平台 `bot.qq.com` 那套官方机器人 API（AppID/AppSecret、group/user openid、网关事件、URL 报备），本插件里没有那层传输。文中出现「官方接口 / 官方文档 / 官方 API」的地方，说的都是**源插件当年走的那条路**，拿来解释某项能力为什么在这里换成了降级做法或干脆不做。
 
 ## 版本
-4.0.1（对应 Alife 客户端 4.2.x）
+4.0.2（对应 Alife 客户端 4.2.x；`QQ聊天` 的两代形状都能编过、都能改写）
 
 ## 依赖
 - Alife.Function.FunctionCaller
@@ -14,7 +16,7 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 
 1. `[12345()]` 后面是空的 —— 框架只取 `Sender.Nickname`，名片（群内显示名）根本没参与，昵称为空时直接留一个空括号
 2. `@<12345>` 是一串号码 —— 模型不知道那是谁，也没法在回复里按名字@人
-3. `[CQ:record,file=...]`、`[CQ:xml,data=...]`、`[CQ:music,...]`、`[CQ:video,...]`、`[CQ:pos,...]` 这些段**原样穿过**框架的转换层，几百字符的转义 JSON 挤满上下文
+3. `[CQ:record,file=...]`、`[CQ:xml,data=...]`、`[CQ:music,...]`、`[CQ:video,...]`、`[CQ:pos,...]` 这些段**原样穿过**框架的转换层，几百字符的转义 JSON 挤满上下文（在役那代 4.x 的 QQ聊天 已经把 `record`、`image` 渲染成 `[音频: …]`、`[图片: …]`，`json/xml/music/pos/video` 和 `qq=all` 的@全体仍然照穿）
 4. 机器人自己发出去的消息会被协议端推回来（`post_type=message_sent` 也走 `OneBotMessageEvent` 判定），模型看到的是"别人说了一句我刚才说的话"
 5. QQ 个人号侧没有按钮回调，模型给出的"请回复 1/2/3"没有任何机制记住对方选的是第几项、还有没有效
 
@@ -48,17 +50,31 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 [10001(值日小明)]:2〔是对菜单「今晚吃什么」第 2 项「日料」的选择｜名额 1/2，有效；这个人的可选次数已经用满〕
 ```
 
+`QQ聊天` 在机器上有两代形状，改写层都认：源码树里是 `[Q群消息(id,群名)]` + `[私聊][QQ号(昵称)]:正文`，`Storage\Plugins` 下在役的 4.x 是 `[群聊消息(id,群名)]` / `[私聊消息(id,昵称)]`，**且私聊正文不带发言人前缀**。只按前一种写的话，私聊那一段的补昵称、压段、菜单对账会整块静默失效（4.0.1 就是这样），所以私聊块改成认头部、就地改写后面的光身正文行：
+
+```
+[群聊消息(12345,研发(1)群)]
+[10001(值日小明)]:@你 看下 [语音: https://gchat.qpic.cn/a.amr]
+[10001(值日小明)]:2〔菜单「今晚吃什么」已经收满，这条选择不要执行〕
+(回复请保持1-20字。注意分清群聊场合，不要随便插话，避免刷屏)
+
+[私聊消息(10007,阿七)]
+在吗 [语音: https://gchat.qpic.cn/c.amr] @你
+1〔是对菜单「私聊点单」第 1 项「拿铁」的选择｜第 1 次，有效〕
+(回复请保持1-20字)
+```
+
 ## 与源插件的能力对照
-| 源插件（QQ 官方机器人） | 这里的去处 | 说明 |
+| 源插件那一行（KiraAI 走 QQ 开放平台官方机器人 API） | 本插件的去处（OneBot 协议端） | 说明 |
 |---|---|---|
 | 全消息桥接（非@消息也进上下文） | 不需要 | OneBot 侧本来就把群消息全量喂给框架，这是 Alife 的优势 |
 | 发言人名片/昵称补全 | 改写层 + `PersonDirectory` | 名片优先，且**跨会话记住**（源插件靠每次调 API 查群成员） |
 | `@号码` → `@名字` | 改写层 | 认不出的人留原文；`@` 自己写成 `@你` |
-| 原始段压缩（json/xml/music/pos/record/video） | 改写层 | `[卡片: 标题]`、`[语音]`、`[音乐分享: 链接]`、`[位置分享]`，链接保留可直接转交 `read_attached_file` |
+| 原始段压缩（json/xml/music/pos/record/video） | 改写层 | `[卡片: 标题]`、`[语音]`、`[音乐分享: 链接]`、`[位置分享]`，链接保留可直接转交 `read_attached_file`。在役那代 4.x 的 QQ聊天 自己就把 `record`/`image` 渲染成了 `[音频: …]`/`[图片: …]`，改写层再遇到已经渲染好的行是无害的（没有 CQ 段可压） |
 | 自发回声去重 | 改写层 `·你自己` | 不删（删了会丢上下文），标注身份让模型别接茬 |
 | `qq_button` 内联键盘 + `INTERACTION_CREATE` 回调对账 | `create_menu` + `MenuLedger` | OneBot 没有按钮回调，编号回复就是点击通道。`once/max/per/ttl/until/cooldown/hard/shared/notify` 全部保留，短码 `~<36进制序号>` 对应源插件的按钮 token，三级匹配（短码 → message_id → 会话+选项）、收满/过期/冷却/歧义四种判定都照抄；**对不上时宁可列候选让模型问清楚，绝不猜** |
 | 按钮台账落盘 | `menu.json` | 原子写（`.tmp` + `Move`），重启不丢计数，序号不会撞号 |
-| `file_intake`（读附件正文） | `read_attached_file` | 2MB / 8000 字符 / 20 秒上限、UTF-8→BOM→GBK(936) 编码链、二进制后缀黑名单 + 魔数嗅探、`1.5 KB` 这种人话大小，全部移植；额外支持群文件 `file_id` 换下载地址 |
+| `file_intake`（读附件正文） | `read_attached_file` | 2MB / 8000 字符 / 20 秒上限、UTF-8→BOM→GBK(936) 编码链、二进制后缀黑名单 + 魔数嗅探、`1.5 KB` 这种人话大小，全部移植；额外支持群文件 `file_id` 换下载地址。**GBK 这一档在你这台机器上是空档**（见下「装到机器上才暴露的」） |
 | `IdentityStore`（LRU 身份缓存） | `PersonDirectory` | 容量 8192（可配）、LRU 淘汰、名片按群分桶、群名缓存、本地模糊搜索打分（QQ号 4 / 精确 3 / 前缀 2 / 包含 1） |
 | `GroupInfoCache` | 并入 `PersonDirectory` 的群名表 | 不需要单独的失败集合：三端拿不到群名就是拿不到，直接留空 |
 | 管理侧限流（撤回 10QPS、禁言 60QPM…） | 交给 **Suran.GroupManager** | 写侧动作全部在群管插件里：`BanMember`/`UnbanMember`/`SetMemberCard`/`RecallMessage`/`KickMember`/`WholeGroupBan`/`PublishGroupNotice`/`QueryGroupNotices`/`DeleteGroupNotice`/`SetEssenceMessage`/`ListEssenceMessages`/`SetSpecialTitle`/`CheckJoinRequests`/`HandleJoinRequest`。本插件只做查询，工具的 Explanation 里明确写了这条分工，避免两处都能改群状态 |
@@ -86,7 +102,7 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 
 写侧的兼容与实弹验证在 Suran.GroupManager / Suran.QQMedia 那边已经做过；本插件这几个查询动作里，`get_group_shut_list`、`shut_up_me_timestamp`、`get_group_at_all_remain` **还没实弹**（见下）。
 
-## 从 QQ 官方机器人文档抄下来的几条硬约束
+## 从源插件那条路（QQ 开放平台官方机器人）文档抄下来的几条硬约束
 源插件的复杂度几乎都来自这几条，看清它们才知道哪些移植有意义：
 
 - **发送侧只有 4 种消息形态**：`msg_type=0` 文本、`2` Markdown、`7` 富媒体（还有 ark/embed），Markdown 与键盘都要后台权限，缺权限直接报 `40034008/40034009/40034011/40034124/40034127`，键盘行列超限 `40034029` → 这里的 `send_rich` 因此选择降级而不是发语法
@@ -126,8 +142,11 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
 两个文件都是原子写（先 `.tmp` 再 `Move`）。里面只有 QQ 号、昵称、群名片、群名和菜单文本，**不含任何密钥**；但 QQ 号是个人信息，别把 Storage 目录分享出去。
 
 ## 验证状态（诚实版）
-- **编译**：`dotnet build .buildcheck/QQBridgeCheck.csproj` → 0 警告 0 错误
-- **离线探针**：`scratch/qbridge-probe`（`dotnet run --project QQBridgeProbe.csproj`，或看 `probe-out.txt`）跑过九段核对：注册面文档行、改写层真实入站形状（名片/空昵称/段压缩/回声/菜单对账/@摘除/群头限定）、台账的 once/per/max/cooldown/shared/短码/超范围/歧义/过期与跨零点 `until`、存盘读回不撞号且计数还在、通讯录 LRU 与打分与精确重名拒猜、Plainize/4000 字拆条/超长单行硬拆、编码链与二进制嗅探与人话大小、选项解析与截断
+- **编译**：两个代际的门都要过，`powershell -File .buildcheck/runtime-gate.ps1`
+  - `.buildcheck/QQBridgeRuntimeCheck.csproj` → 在役代际：引用宿主 `D:\Alife\Client\resources\bin` 的框架 DLL 与 `D:\Alife\Runtime\PluginContext\CompiledPlugins` 里已编译的 `Alife.Function.QChat`/`FunctionCaller` DLL（实现程序集，不走引用程序集包）
+  - `.buildcheck/QQBridgeCheck.csproj` → AlifeSrc 源码代际（`ProjectReference`）
+  - 只跑后者是 4.0.1 翻车的原因：源码树那份 QQ聊天 与机器上在役的那份不是一个代际，本地 0 警告 0 错误、热编译照样 CS0246
+- **离线探针**：`scratch/qbridge-probe`（`dotnet run --project QQBridgeProbe.csproj`，或看 `probe-out.txt`）跑过十段核对：注册面文档行、改写层真实入站形状（名片/空昵称/段压缩/回声/菜单对账/@摘除/群头限定）、**在役代际的群头与无前缀私聊正文**、台账的 once/per/max/cooldown/shared/短码/超范围/歧义/过期与跨零点 `until`、存盘读回不撞号且计数还在、通讯录 LRU 与打分与精确重名拒猜、Plainize/4000 字拆条/超长单行硬拆、编码链与二进制嗅探与人话大小、选项解析与截断
 - **探针顺手抓出来并修掉的坑**：`Close(menu, reason)` 私有重载被写丢导致内部关单全绑到公开重载、`ConvertAll(FormatShort)` 方法组类型推不出来、`UTF8Encoding(throwOnInvalidBytes:)` 单参构造不存在、报了编号超出选项数与只报短码两种回复会被**静默丢弃**（模型看不到任何对账）、`![图片](链接)` 被链接规则吃掉留下 `!图片：链接`、代码页 936 在没有注册 CodePagesEncodingProvider 的运行时抛的是 `NotSupportedException`（原来只接 `ArgumentException`，会把读文件流程炸穿）
 - **发布后复查又抓出来修掉的（4.0.1）**：
   - `create_menu` 的 `hard=false` 只写进台账、对账文案照旧写"不要执行"，等于这个开关是摆设 → 现在硬拦与只提示两种口径分开
@@ -137,6 +156,12 @@ QQ 消息增强：把 OneBot 侧收到的消息**读清楚**、把要发的消�
   - `[CQ:at,qq=all]` 框架不过滤，会整段留在上下文里 → 压成 `@全体`
   - GBK 什么字节都能"解出字"，无后缀的二进制会被当成文本喂给模型 → 解完再看乱码比例
   - 超长单行硬拆可能切在 emoji 的代理对中间；连接维护循环在插件销毁时留一条没人看的失败任务；`OnDestroy` 先断连接后落盘（断开抛异常就把通讯录一起丢了）
+- **装到机器上才暴露的（4.0.2）**：
+  - `bridge_state` 里写死了 `KeyValuePair<long, GroupState>`，在役那代 QQ聊天 里这个状态叫 `GroupMessageSource` → 热编译直接 CS0246，整个插件装载失败；改成 `var`，两代的 `.IsEnabled` 都取得到
+  - 群头只认 `[Q群消息(…)]`，在役的是 `[群聊消息(…)]` 与 `[私聊消息(…)]` → 群号、群名、名片与菜单对账在在役那代整块认不出来
+  - 在役那代的私聊正文不带发言人前缀（`BufferPrivateMessage` 只塞正文）→ 私聊的补昵称、压段、菜单对账静默失效；现在认私聊头，把昵称记进通讯录，对后面的光身正文行就地改写，菜单按私聊会话（群号 0）对账，自己发的不再记账
+  - 插件显示名按你要求从「QQ消息增强」改成「QQ官方机器人聊天增强」（`[Module]` 名、工具集描述、改写说明首句三处同步）；名字里的"官方机器人"指被增强的那只机器人账号，传输仍是协议端 OneBot v11，开头那段专门把这件事说死了，免得再被读成官方开放平台那条路
+- **已知空档（本机实测，不是 bug）**：探针跑 `Encoding.GetEncoding(936)` 抛的是 `NotSupportedException`，而平台源码里没有任何地方注册 `CodePagesEncodingProvider`、热编译插件也引不了那个 NuGet 包 → **GBK 编码的文本附件在这台机器上解不出正文**。代码不会因此炸（`TryGetEncoding` 接住 null 走二进制分支），失败话术会如实写"这台机器还不支持 GBK（代码页 936）"，但中文老编码的附件（早期 txt/日志、部分群文件）会读不了。要补得让宿主侧注册 provider，属于框架层的事
 - **没做的**：没连协议端实弹。`group_status`/`muted_members`/`sync_group_members`/`read_attached_file`/`send_rich`/`create_menu` 六条都要在 NapCat 或 LLOneBot 上真跑一遍才算数，其中 `get_group_shut_list`、`shut_up_me_timestamp`、`get_group_at_all_remain` 三家的支持面差异最容易在这里出岔子
 
 ## 打包

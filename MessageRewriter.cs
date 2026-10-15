@@ -21,9 +21,10 @@ public sealed class MessageRewriter(PersonDirectory directory)
         @"^(?<private>\[私聊\])?\[(?<id>\d{4,12})(?:\((?<name>[^)]*)\))?\]:(?<body>.*)$",
         RegexOptions.Compiled);
 
-    // 群名里带括号是常态（「研发(1)群」），所以名字用惰性匹配交给结尾的 )] 去收
-    static readonly Regex GroupHeaderPattern = new(
-        @"\[Q群消息\((?<id>\d+)(?:,(?<name>.*?))?\)\]",
+    // 两代 QQ聊天 的头部都得认：旧的 [Q群消息(id,群名)]，新的 [群聊消息(id,群名)] 与 [私聊消息(id,昵称)]。
+    // 名字里带括号是常态（「研发(1)群」），所以用惰性匹配交给结尾的 )] 去收。
+    static readonly Regex SourceHeaderPattern = new(
+        @"\[(?<kind>Q群消息|群聊消息|私聊消息)\((?<id>\d+)(?:,(?<name>.*?))?\)\]",
         RegexOptions.Compiled);
 
     static readonly Regex AtPattern = new(@"@(?<id>\d{4,12})(?![0-9])", RegexOptions.Compiled);
@@ -46,44 +47,74 @@ public sealed class MessageRewriter(PersonDirectory directory)
 
         string[] lines = message.Split('\n');
         long currentGroupId = 0;
+        long currentPrivateUserId = 0;
         for (int index = 0; index < lines.Length; index++)
         {
-            Match header = GroupHeaderPattern.Match(lines[index]);
+            Match header = SourceHeaderPattern.Match(lines[index]);
             if (header.Success)
             {
-                // 号码长到放不下（协议端抽风给了非数字）就把群号当不知道，不能沿用上一个群的
-                currentGroupId = long.TryParse(header.Groups["id"].Value, out long headerGroupId) ? headerGroupId : 0;
-                if (currentGroupId != 0)
+                // 号码解析不出来（协议端抽风给了非数字）就把这块的来源当不知道，不能沿用上一块的
+                long id = long.TryParse(header.Groups["id"].Value, out long headerId) ? headerId : 0;
+                bool isPrivateHeader = header.Groups["kind"].Value == "私聊消息";
+                currentGroupId = isPrivateHeader ? 0 : id;
+                currentPrivateUserId = isPrivateHeader ? id : 0;
+                if (isPrivateHeader)
                 {
-                    directory.LearnGroup(currentGroupId, header.Groups["name"].Value);
+                    directory.Learn(id, header.Groups["name"].Value, 0, "");
                 }
-            }
-
-            Match speaker = SpeakerPattern.Match(lines[index]);
-            if (speaker.Success == false)
-            {
+                else
+                {
+                    directory.LearnGroup(id, header.Groups["name"].Value);
+                }
                 continue;
             }
 
-            long userId = long.Parse(speaker.Groups["id"].Value);
-            string eventName = speaker.Groups["name"].Value;
-            string body = speaker.Groups["body"].Value;
-            bool isPrivate = speaker.Groups["private"].Success;
-            long groupId = isPrivate ? 0 : currentGroupId;
-            bool isSelf = BotId != 0 && userId == BotId;
+            Match speaker = SpeakerPattern.Match(lines[index]);
+            if (speaker.Success)
+            {
+                currentPrivateUserId = 0;
 
-            string displayName = ResolveDisplayName(userId, groupId, eventName);
-            string rewrittenBody = RewriteBody(body, groupId);
-            string verdict = isSelf || BindMenuReplies == false || Ledger == null
-                ? ""
-                : MatchMenu(userId, groupId, body);
+                long userId = long.Parse(speaker.Groups["id"].Value);
+                string eventName = speaker.Groups["name"].Value;
+                string body = speaker.Groups["body"].Value;
+                bool isPrivate = speaker.Groups["private"].Success;
+                long groupId = isPrivate ? 0 : currentGroupId;
+                bool isSelf = BotId != 0 && userId == BotId;
 
-            string tag = (isPrivate ? "[私聊]" : "") + "[" + userId + (displayName.Length > 0 ? "(" + displayName + ")" : "")
-                + (isSelf && MarkSelfEcho ? "·你自己" : "") + "]:";
-            lines[index] = tag + rewrittenBody + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
+                string displayName = ResolveDisplayName(userId, groupId, eventName);
+                string rewrittenBody = RewriteBody(body, groupId);
+                string verdict = isSelf || BindMenuReplies == false || Ledger == null
+                    ? ""
+                    : MatchMenu(userId, groupId, body);
+
+                string tag = (isPrivate ? "[私聊]" : "") + "[" + userId + (displayName.Length > 0 ? "(" + displayName + ")" : "")
+                    + (isSelf && MarkSelfEcho ? "·你自己" : "") + "]:";
+                lines[index] = tag + rewrittenBody + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
+                continue;
+            }
+
+            // 新一代的私聊缓存不带 [QQ号(昵称)]: 前缀，正文光着来，只能认着上一行的私聊头就地改写
+            if (currentPrivateUserId != 0)
+            {
+                lines[index] = RewritePrivateLine(lines[index], currentPrivateUserId);
+            }
         }
 
         return string.Join("\n", lines);
+    }
+
+    string RewritePrivateLine(string line, long userId)
+    {
+        if (line.Trim().Length == 0)
+        {
+            return line;
+        }
+
+        string result = RewriteBody(line, 0);
+        string verdict = userId == BotId || BindMenuReplies == false || Ledger == null
+            ? ""
+            : MatchMenu(userId, 0, line);
+        return result + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
     }
 
     string ResolveDisplayName(long userId, long groupId, string eventName)
