@@ -4,11 +4,12 @@ using System.Globalization;
 using System.IO;
 using System.Text.Json;
 
-namespace Suran.QQBridge;
+namespace Suran.QQBotEnhance;
 
 /// <summary>
 /// 编号菜单台账：把发出去的「1.xxx 2.xxx」选项登记成活动，用户回一条文本就能对上是哪个活动的第几项，
-/// 并按 once/max/per/ttl/until/cooldown 判定这次选择还有没有效。QQ 个人号侧没有按钮回调，这份台账就是点按钮的替代通道。
+/// 并按 once/max/per/ttl/until/cooldown 判定这次选择还有没有效。官方机器人的按钮只在 markdown 消息上、
+/// 还要开互动事件权限才收得到，这份编号台账是不依赖按钮权限的点选通道。
 /// </summary>
 public sealed class MenuLedger(int capacity)
 {
@@ -17,8 +18,8 @@ public sealed class MenuLedger(int capacity)
     public sealed class OptionState
     {
         public int Total { get; set; }
-        public Dictionary<long, int> UserCounts { get; set; } = [];
-        public Dictionary<long, DateTime> LastClicks { get; set; } = [];
+        public Dictionary<string, int> UserCounts { get; set; } = [];
+        public Dictionary<string, DateTime> LastClicks { get; set; } = [];
     }
 
     public sealed class MenuRecord
@@ -26,9 +27,9 @@ public sealed class MenuLedger(int capacity)
         public int Seq { get; set; }
         public string Code { get; set; } = "";
         public string Title { get; set; } = "";
-        public long GroupId { get; set; }
-        public long OwnerUserId { get; set; }
-        public long? MessageId { get; set; }
+        public string GroupId { get; set; } = "";
+        public string OwnerUserId { get; set; } = "";
+        public string? MessageId { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime? ExpiresAt { get; set; }
         public int MaxTotal { get; set; }
@@ -83,7 +84,7 @@ public sealed class MenuLedger(int capacity)
 
     public int Count => records.Count;
 
-    public MenuRecord Create(long groupId, long ownerUserId, string title, List<string> options,
+    public MenuRecord Create(string groupId, string ownerUserId, string title, List<string> options,
         int ttlSeconds, string? until, int maxTotal, int perUser, bool once, int cooldownSeconds,
         bool hard, bool shared, bool notify)
     {
@@ -115,7 +116,7 @@ public sealed class MenuLedger(int capacity)
         return record;
     }
 
-    public MatchResult? TryMatch(long userId, long groupId, string replyText)
+    public MatchResult? TryMatch(string userId, string groupId, string replyText)
     {
         ParsedReply? parsed = ParseReply(replyText);
         if (parsed == null)
@@ -322,7 +323,7 @@ public sealed class MenuLedger(int capacity)
         string quota = record.MaxTotal > 0 ? record.Total + "/" + record.MaxTotal : record.Total + " 次";
         string line = "#" + record.Seq + " " + record.Code + "「" + record.Title + "」" + record.Options.Count
             + " 项｜已选 " + quota + "｜" + state;
-        if (record.GroupId != 0)
+        if (record.GroupId.Length > 0)
         {
             line += "｜群 " + record.GroupId;
         }
@@ -363,15 +364,15 @@ public sealed class MenuLedger(int capacity)
 
     static string FormatShort(MenuRecord record) => "#" + record.Seq + "「" + record.Title + "」";
 
-    List<Candidate> CollectCandidates(long userId, long groupId, ParsedReply parsed)
+    List<Candidate> CollectCandidates(string userId, string groupId, ParsedReply parsed)
     {
         List<Candidate> matched = [];
         List<Candidate> overflowed = [];
         foreach (MenuRecord record in records.Values)
         {
             // 会话位置必须对上：群菜单只在同一个群里认，私聊菜单只对发起人本人认
-            bool samePlace = record.GroupId == groupId
-                && (record.GroupId != 0 || record.OwnerUserId == userId);
+            bool samePlace = string.Equals(record.GroupId, groupId, StringComparison.Ordinal)
+                && (record.GroupId.Length > 0 || record.OwnerUserId == userId);
             if (samePlace == false)
             {
                 continue;

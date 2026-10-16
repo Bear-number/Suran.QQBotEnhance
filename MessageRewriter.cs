@@ -1,42 +1,33 @@
 using System;
 using System.Text.RegularExpressions;
 
-namespace Suran.QQBridge;
+namespace Suran.QQBotEnhance;
 
 /// <summary>
-/// 改写进入对话的 QQ 消息文本：把裸QQ号的@换成名字、把框架不认识的原始消息段压成一行、
-/// 标注机器人自己的回声，并把回复对回本插件发出的编号菜单。
+/// 改写进入对话的 QQ 消息文本：把发言人后面的裸 openid 换成昵称、把 @openid 换成 @名字、
+/// 给群号补上已知群名、标出机器人自己的回声，并把回复对回本插件发出的编号菜单。
 /// </summary>
 public sealed class MessageRewriter(PersonDirectory directory)
 {
     public bool ResolveAtName { get; set; } = true;
-    public bool PreferGroupCard { get; set; } = true;
-    public bool NormalizeSegments { get; set; } = true;
     public bool MarkSelfEcho { get; set; } = true;
     public bool BindMenuReplies { get; set; } = true;
-    public long BotId { get; set; }
+    public string BotId { get; set; } = "";
     public MenuLedger? Ledger { get; set; }
 
+    // 官方机器人给的是 openid：字母数字串，不是 QQ 号那样的纯数字，按数字认会一条都匹配不上
+    const string OpenIdToken = "[0-9A-Za-z_-]{8,64}";
+
     static readonly Regex SpeakerPattern = new(
-        @"^(?<private>\[私聊\])?\[(?<id>\d{4,12})(?:\((?<name>[^)]*)\))?\]:(?<body>.*)$",
+        @"^\[(?<id>" + OpenIdToken + @")(?:\((?<name>[^)]*)\))?\]:(?<body>.*)$",
         RegexOptions.Compiled);
 
-    // 两代 QQ聊天 的头部都得认：旧的 [Q群消息(id,群名)]，新的 [群聊消息(id,群名)] 与 [私聊消息(id,昵称)]。
-    // 名字里带括号是常态（「研发(1)群」），所以用惰性匹配交给结尾的 )] 去收。
+    // 名字里带括号是常态（「研发(1)群」），所以群名用惰性匹配交给结尾的 )] 去收
     static readonly Regex SourceHeaderPattern = new(
-        @"\[(?<kind>Q群消息|群聊消息|私聊消息)\((?<id>\d+)(?:,(?<name>.*?))?\)\]",
+        @"\[(?<kind>群聊消息|私聊消息)\((?<id>" + OpenIdToken + @")(?:,(?<name>.*?))?\)\]",
         RegexOptions.Compiled);
 
-    static readonly Regex AtPattern = new(@"@(?<id>\d{4,12})(?![0-9])", RegexOptions.Compiled);
-    static readonly Regex AtAllPattern = new(@"\[CQ:at,.*?qq=all[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-    static readonly Regex RecordPattern = new(@"\[CQ:record[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex VideoPattern = new(@"\[CQ:video[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex CardPattern = new(@"\[CQ:(?:json|xml)[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex MusicPattern = new(@"\[CQ:music[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex LocationPattern = new(@"\[CQ:pos[^\]]*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex LinkPattern = new(@"(https?://[^\s,\]\[\{}""'<>]+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    static readonly Regex CardTitlePattern = new(@"""title""\s*:\s*""([^""]{1,40})""", RegexOptions.Compiled);
+    static readonly Regex AtPattern = new(@"@(?<id>" + OpenIdToken + @")(?![0-9A-Za-z_-])", RegexOptions.Compiled);
 
     public string Rewrite(string message)
     {
@@ -46,146 +37,81 @@ public sealed class MessageRewriter(PersonDirectory directory)
         }
 
         string[] lines = message.Split('\n');
-        long currentGroupId = 0;
-        long currentPrivateUserId = 0;
+        string currentGroupId = "";
         for (int index = 0; index < lines.Length; index++)
         {
             Match header = SourceHeaderPattern.Match(lines[index]);
             if (header.Success)
             {
-                // 号码解析不出来（协议端抽风给了非数字）就把这块的来源当不知道，不能沿用上一块的
-                long id = long.TryParse(header.Groups["id"].Value, out long headerId) ? headerId : 0;
-                bool isPrivateHeader = header.Groups["kind"].Value == "私聊消息";
-                currentGroupId = isPrivateHeader ? 0 : id;
-                currentPrivateUserId = isPrivateHeader ? id : 0;
-                if (isPrivateHeader)
+                bool isGroupHeader = header.Groups["kind"].Value == "群聊消息";
+                string headerId = header.Groups["id"].Value;
+                currentGroupId = isGroupHeader ? headerId : "";
+                if (isGroupHeader == false)
                 {
-                    directory.Learn(id, header.Groups["name"].Value, 0, "");
+                    continue;
                 }
-                else
+
+                string headerName = header.Groups["name"].Value;
+                if (headerName.Length > 0)
                 {
-                    directory.LearnGroup(id, header.Groups["name"].Value);
+                    directory.LearnGroup(headerId, headerName);
+                    continue;
+                }
+                string knownGroupName = directory.GroupName(headerId);
+                if (knownGroupName.Length > 0)
+                {
+                    lines[index] = "[群聊消息(" + headerId + "," + knownGroupName + ")]";
                 }
                 continue;
             }
 
             Match speaker = SpeakerPattern.Match(lines[index]);
-            if (speaker.Success)
+            if (speaker.Success == false)
             {
-                currentPrivateUserId = 0;
-
-                long userId = long.Parse(speaker.Groups["id"].Value);
-                string eventName = speaker.Groups["name"].Value;
-                string body = speaker.Groups["body"].Value;
-                bool isPrivate = speaker.Groups["private"].Success;
-                long groupId = isPrivate ? 0 : currentGroupId;
-                bool isSelf = BotId != 0 && userId == BotId;
-
-                string displayName = ResolveDisplayName(userId, groupId, eventName);
-                string rewrittenBody = RewriteBody(body, groupId);
-                string verdict = isSelf || BindMenuReplies == false || Ledger == null
-                    ? ""
-                    : MatchMenu(userId, groupId, body);
-
-                string tag = (isPrivate ? "[私聊]" : "") + "[" + userId + (displayName.Length > 0 ? "(" + displayName + ")" : "")
-                    + (isSelf && MarkSelfEcho ? "·你自己" : "") + "]:";
-                lines[index] = tag + rewrittenBody + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
                 continue;
             }
 
-            // 新一代的私聊缓存不带 [QQ号(昵称)]: 前缀，正文光着来，只能认着上一行的私聊头就地改写
-            if (currentPrivateUserId != 0)
-            {
-                lines[index] = RewritePrivateLine(lines[index], currentPrivateUserId);
-            }
+            string userId = speaker.Groups["id"].Value;
+            string body = speaker.Groups["body"].Value;
+            bool isSelf = BotId.Length > 0 && userId == BotId;
+            directory.Learn(userId, speaker.Groups["name"].Value);
+
+            string displayName = directory.DisplayName(userId);
+            string verdict = isSelf || BindMenuReplies == false || Ledger == null
+                ? ""
+                : MatchMenu(userId, currentGroupId, body);
+            string tag = "[" + userId + (displayName.Length > 0 ? "(" + displayName + ")" : "")
+                + (isSelf && MarkSelfEcho ? "·你自己" : "") + "]:";
+            lines[index] = tag + (ResolveAtName ? ReplaceAt(body) : body)
+                + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
         }
 
         return string.Join("\n", lines);
     }
 
-    string RewritePrivateLine(string line, long userId)
+    string ReplaceAt(string body)
     {
-        if (line.Trim().Length == 0)
+        return AtPattern.Replace(body, match =>
         {
-            return line;
-        }
-
-        string result = RewriteBody(line, 0);
-        string verdict = userId == BotId || BindMenuReplies == false || Ledger == null
-            ? ""
-            : MatchMenu(userId, 0, line);
-        return result + (verdict.Length > 0 ? "〔" + verdict + "〕" : "");
-    }
-
-    string ResolveDisplayName(long userId, long groupId, string eventName)
-    {
-        string known = directory.DisplayName(userId, groupId, PreferGroupCard);
-        if (known.Length > 0)
-        {
-            return known;
-        }
-        return eventName;
-    }
-
-    string RewriteBody(string body, long groupId)
-    {
-        string result = NormalizeSegments ? NormalizeSegmentsOf(body) : body;
-        if (ResolveAtName)
-        {
-            result = AtPattern.Replace(result, match => ReplaceAt(match, groupId));
-        }
-        return result;
-    }
-
-    string ReplaceAt(Match match, long groupId)
-    {
-        long userId = long.Parse(match.Groups["id"].Value);
-        if (BotId != 0 && userId == BotId)
-        {
-            return "@你";
-        }
-        string name = directory.DisplayName(userId, groupId, PreferGroupCard);
-        return name.Length > 0 ? "@" + name : match.Value;
-    }
-
-    string NormalizeSegmentsOf(string body)
-    {
-        // 框架的 @过滤只认数字号，qq=all 的@全体会整条原始段留在上下文里
-        string result = AtAllPattern.Replace(body, "@全体");
-        result = RecordPattern.Replace(result, match => Shorten("语音", match.Value));
-        result = VideoPattern.Replace(result, match => Shorten("视频", match.Value));
-        result = CardPattern.Replace(result, match => Shorten("卡片", match.Value));
-        result = MusicPattern.Replace(result, match => Shorten("音乐分享", match.Value));
-        result = LocationPattern.Replace(result, "[位置分享]");
-        return result;
-    }
-
-    static string Shorten(string label, string segment)
-    {
-        if (label == "卡片")
-        {
-            Match title = CardTitlePattern.Match(segment);
-            if (title.Success)
+            string userId = match.Groups["id"].Value;
+            if (BotId.Length > 0 && userId == BotId)
             {
-                return "[卡片: " + title.Groups[1].Value + "]";
+                return "@你";
             }
-        }
-        Match link = LinkPattern.Match(segment);
-        return link.Success
-            ? "[" + label + ": " + link.Value.TrimEnd('.', ',', ';', ':', '。', '，', '、') + "]"
-            : "[" + label + "]";
+            string name = directory.DisplayName(userId);
+            return name.Length > 0 ? "@" + name : match.Value;
+        });
     }
 
-    string MatchMenu(long userId, long groupId, string body)
+    string MatchMenu(string userId, string groupId, string body)
     {
         MenuLedger.MatchResult? match = Ledger!.TryMatch(userId, groupId, StripAtMarkup(body));
-        if (match == null)
-        {
-            return "";
-        }
-        return match.Verdict;
+        return match == null ? "" : match.Verdict;
     }
 
+    /// <summary>
+    /// 去掉 @ 标记和「@你」，只留正文里真正说的那个编号；名字是改写层填进去的，本来就不参与对账。
+    /// </summary>
     static string StripAtMarkup(string text)
     {
         return AtPattern.Replace(text, "").Replace("@你", "").Trim();
